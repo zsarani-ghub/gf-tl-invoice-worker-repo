@@ -31,6 +31,7 @@ class LoadLookupRequest(BaseModel):
 # Core worker logic
 # ============================================================
 
+print(f"LOGISTICALLY_USERNAME raw value: [{LOGISTICALLY_USERNAME}]")
 def find_load_in_logistically(load_number: str) -> dict:
     """
     Logs into Logistically and attempts to open a specific load page.
