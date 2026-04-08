@@ -13,7 +13,7 @@ app = FastAPI()
 LOGISTICALLY_BASE_URL = os.getenv("LOGISTICALLY_BASE_URL", "").rstrip("/")
 LOGISTICALLY_USERNAME = os.getenv("LOGISTICALLY_USERNAME", "")
 LOGISTICALLY_PASSWORD = os.getenv("LOGISTICALLY_PASSWORD", "")
-HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
+HEADLESS = os.getenv("HEADLESS", "true").lower() == "false"
 
 
 # ============================================================
