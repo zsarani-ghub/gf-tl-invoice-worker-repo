@@ -35,12 +35,6 @@ def find_load_in_logistically(load_number: str) -> dict:
     """
     Logs into Logistically and attempts to open a specific load page.
     Returns whether the load appears to exist.
-
-    This version includes extra debug logging to help identify:
-    - missing env vars
-    - page load issues
-    - selector issues
-    - login problems
     """
     if not LOGISTICALLY_BASE_URL:
         raise ValueError("LOGISTICALLY_BASE_URL is not set")
@@ -51,7 +45,10 @@ def find_load_in_logistically(load_number: str) -> dict:
     if not LOGISTICALLY_PASSWORD:
         raise ValueError("LOGISTICALLY_PASSWORD is not set")
 
-    login_url = f"{LOGISTICALLY_BASE_URL}/login"
+    # Based on the provided login page HTML, login is served from "/"
+    login_url = f"{LOGISTICALLY_BASE_URL}/"
+
+    # Based on your SOP, this is the order route pattern after login
     order_url = f"{LOGISTICALLY_BASE_URL}/tms/#/3pl/orders/{load_number}"
 
     print("=== Worker config check ===")
@@ -74,60 +71,29 @@ def find_load_in_logistically(load_number: str) -> dict:
             print("=== Opening Logistically login page ===")
             page.goto(login_url, wait_until="networkidle", timeout=60000)
 
-            # Give dynamic JS a moment to finish rendering
-            print("=== Waiting for login page JS render ===")
-            page.wait_for_timeout(3000)
-
             print("=== Current URL after login page load ===")
             print(page.url)
 
-            # Log a small preview of page HTML to help debug selector issues
-            print("=== Login page content preview ===")
-            print(page.content()[:1500])
+            # Short wait for any JS behavior
+            page.wait_for_timeout(2000)
 
             # ------------------------------------------------
-            # Step 2: Locate username field
+            # Step 2: Fill login form using exact selectors
+            # From provided page source:
+            # - email input id="email"
+            # - password input id="password"
+            # - submit button id="sign-in"
             # ------------------------------------------------
-            all_inputs = page.locator("input")
-            input_count = all_inputs.count()
-            print(f"=== Input count found on page: {input_count} ===")
-
-            if input_count == 0:
-                raise ValueError("No input fields found on Logistically login page")
-
-            # Debug approach:
-            # use first input as username field
-            username_input = page.locator("input").first
-
-            print("=== Filling username field ===")
-            username_input.fill(LOGISTICALLY_USERNAME)
-
-            # ------------------------------------------------
-            # Step 3: Locate password field
-            # ------------------------------------------------
-            password_input = page.locator('input[type="password"]')
-            password_count = password_input.count()
-            print(f"=== Password field count found: {password_count} ===")
-
-            if password_count == 0:
-                raise ValueError("No password field found on Logistically login page")
+            print("=== Filling email field ===")
+            page.locator("#email").fill(LOGISTICALLY_USERNAME)
 
             print("=== Filling password field ===")
-            password_input.first.fill(LOGISTICALLY_PASSWORD)
+            page.locator("#password").fill(LOGISTICALLY_PASSWORD)
 
-            # ------------------------------------------------
-            # Step 4: Click login button
-            # ------------------------------------------------
-            button_count = page.locator("button").count()
-            print(f"=== Button count found on page: {button_count} ===")
+            print("=== Clicking sign-in button ===")
+            page.locator("#sign-in").click()
 
-            if button_count == 0:
-                raise ValueError("No button found on Logistically login page")
-
-            print("=== Clicking first button for login ===")
-            page.locator("button").first.click()
-
-            # Wait after login click
+            # Wait after login
             print("=== Waiting after login click ===")
             page.wait_for_timeout(5000)
             page.wait_for_load_state("networkidle", timeout=60000)
@@ -139,7 +105,7 @@ def find_load_in_logistically(load_number: str) -> dict:
             print(page.content()[:1500])
 
             # ------------------------------------------------
-            # Step 5: Open target order page directly
+            # Step 3: Open target order page directly
             # ------------------------------------------------
             print("=== Opening Logistically load page ===")
             page.goto(order_url, wait_until="networkidle", timeout=60000)
@@ -154,7 +120,6 @@ def find_load_in_logistically(load_number: str) -> dict:
             print("=== Body text preview ===")
             print(body_text[:1500])
 
-            # Basic check for whether the load appears on the page or URL
             load_found = (load_number in current_url) or (load_number in body_text)
 
             result = {
