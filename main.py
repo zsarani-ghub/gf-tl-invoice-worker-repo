@@ -1,6 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import sync_playwright
 import os
 import json
 
@@ -11,13 +11,14 @@ import json
 app = FastAPI()
 
 # ============================================================
-# Versioning (VERY important for debugging deployments)
+# Version marker
+# Change this whenever you want to prove a fresh deploy happened
 # ============================================================
 
-APP_VERSION = "worker-debug-2026-04-10-v6"
+APP_VERSION = "worker-debug-2026-04-10-v7"
 
 # ============================================================
-# Environment variables (injected via Cloud Run)
+# Environment variables injected through Cloud Run
 # ============================================================
 
 LOGISTICALLY_BASE_URL = os.getenv("LOGISTICALLY_BASE_URL", "").rstrip("/")
@@ -25,8 +26,9 @@ LOGISTICALLY_USERNAME = os.getenv("LOGISTICALLY_USERNAME", "")
 LOGISTICALLY_PASSWORD = os.getenv("LOGISTICALLY_PASSWORD", "")
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 
+
 # ============================================================
-# Request schema (incoming API payload)
+# Incoming request schema
 # ============================================================
 
 class LoadLookupRequest(BaseModel):
@@ -37,15 +39,16 @@ class LoadLookupRequest(BaseModel):
 
 
 # ============================================================
-# Helper: Detect if current page is login page
+# Helper: Identify whether current page is the login page
 # ============================================================
 
 def is_login_page_text(body_text: str) -> bool:
     """
-    Determines if the current page is the login screen
-    based on presence of multiple login-related keywords.
-    """
+    Detect whether the current page still looks like the TMS login page.
 
+    We use multiple text signals rather than one single keyword
+    to reduce false positives.
+    """
     body_text_lower = body_text.lower()
 
     login_signals = [
@@ -57,28 +60,29 @@ def is_login_page_text(body_text: str) -> bool:
         "powered by logistically tms"
     ]
 
-    # Count how many login indicators are present
     signal_count = sum(1 for s in login_signals if s in body_text_lower)
 
-    # If enough signals are present, assume login page
+    # Require multiple signals before classifying as login page
     return signal_count >= 3
 
 
 # ============================================================
-# Helper: Classify page after navigation
+# Helper: Detect whether current page is a valid order page
+# or a known error/login page
 # ============================================================
 
 def detect_order_page(page, load_number: str) -> dict:
     """
-    Classifies the current page into one of:
+    Classify the page into one of these buckets:
     - login_page
     - not_found_or_no_access
     - order_page
     - unknown
 
-    This is critical to avoid false positives.
+    IMPORTANT:
+    URL alone is not enough because the attempted order URL
+    itself contains the load number even when the page is not valid.
     """
-
     current_url = page.url
     body_text = page.locator("body").inner_text(timeout=15000)
 
@@ -98,7 +102,7 @@ def detect_order_page(page, load_number: str) -> dict:
         }
 
     # ------------------------------------------------
-    # 2. Detect TMS access denied / 403 page
+    # 2. Detect 403 / no access style page
     # ------------------------------------------------
     if (
         "you don't have access to this page or resource" in body_text_lower
@@ -113,8 +117,7 @@ def detect_order_page(page, load_number: str) -> dict:
         }
 
     # ------------------------------------------------
-    # 3. Detect valid order page using strong signals
-    # IMPORTANT: URL alone is NOT trusted
+    # 3. Detect real order page using strong content signals
     # ------------------------------------------------
     strong_order_signals = [
         f"edit order: order {load_lower}",
@@ -130,12 +133,11 @@ def detect_order_page(page, load_number: str) -> dict:
         "invoice"
     ]
 
-    # Count how many order-related signals exist
     strong_signal_count = sum(1 for s in strong_order_signals if s in body_text_lower)
 
     # Only mark as found if:
-    # - load number is present
-    # - AND enough order page indicators exist
+    # - load number appears in page content
+    # - enough real order-page indicators exist
     if load_lower in body_text_lower and strong_signal_count >= 4:
         return {
             "page_type": "order_page",
@@ -146,7 +148,7 @@ def detect_order_page(page, load_number: str) -> dict:
         }
 
     # ------------------------------------------------
-    # 4. Unknown state (safe fallback)
+    # 4. Fallback unknown state
     # ------------------------------------------------
     return {
         "page_type": "unknown",
@@ -158,16 +160,31 @@ def detect_order_page(page, load_number: str) -> dict:
 
 
 # ============================================================
-# Core: Perform login and verify success
+# Helper: Perform login
+# IMPORTANT:
+# This v7 version is intentionally tolerant.
+# It does not fail early just because the page still briefly
+# looks like login after clicking sign-in.
 # ============================================================
 
 def perform_login(page):
     """
-    Logs into Logistically and verifies that login succeeded.
+    Perform login without enforcing an early hard failure.
 
-    If login fails, raises an exception immediately.
+    Some systems:
+    - keep login DOM elements around briefly
+    - establish session asynchronously
+    - redirect slowly
+    - behave differently under automation
+
+    So this function:
+    - opens login page
+    - fills credentials
+    - clicks sign in
+    - waits a little
+    - leaves final success/failure determination
+      to the later order-page navigation step
     """
-
     login_url = f"{LOGISTICALLY_BASE_URL}/"
 
     print("=== Opening login page ===")
@@ -175,51 +192,54 @@ def perform_login(page):
     page.wait_for_timeout(2000)
 
     # Fill credentials
-    print("=== Filling credentials ===")
+    print("=== Filling email field ===")
     page.locator("#email").fill(LOGISTICALLY_USERNAME)
+
+    print("=== Filling password field ===")
     page.locator("#password").fill(LOGISTICALLY_PASSWORD)
 
-    print("=== Clicking sign-in ===")
+    print("=== Clicking sign-in button ===")
     page.locator("#sign-in").click()
 
-    # Wait for login form to disappear (key signal)
+    # Give the app time to establish session / redirect
+    print("=== Waiting after login click ===")
+    page.wait_for_timeout(5000)
+
     try:
-        page.wait_for_selector("#email", state="hidden", timeout=15000)
-    except PlaywrightTimeoutError:
-        print("⚠️ Login form did not disappear in time")
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except Exception:
+        print("=== Network did not fully settle after login click ===")
 
-    # Allow page to settle
-    page.wait_for_timeout(4000)
-    page.wait_for_load_state("networkidle", timeout=60000)
+    print("=== URL after login attempt ===")
+    print(page.url)
 
-    current_url = page.url
-    body_text = page.locator("body").inner_text(timeout=15000)
+    try:
+        body_preview = page.locator("body").inner_text(timeout=15000)[:1000]
+        print("=== Body preview after login attempt ===")
+        print(body_preview)
+    except Exception:
+        print("=== Could not read body preview after login attempt ===")
 
-    print("=== Post-login URL ===", current_url)
-
-    # If still on login page → login failed
-    if is_login_page_text(body_text):
-        raise ValueError("Login failed — still on login page")
-
-    print("✅ Login successful")
-
+    # Do not fail here.
+    # Final determination happens only after trying to open the target order page.
     return True
 
 
 # ============================================================
-# Core: Main business logic (lookup load)
+# Core business logic:
+# Login -> open target order page -> classify result
 # ============================================================
 
 def find_load_in_logistically(load_number: str) -> dict:
     """
-    Full workflow:
-    1. Login
-    2. Navigate to load URL
-    3. Detect page type
-    4. Return structured result
+    Full TMS lookup workflow:
+    1. Validate configuration
+    2. Login
+    3. Open target order page
+    4. Detect whether load is truly found
+    5. Return structured result
     """
-
-    # Basic config validation
+    # Validate required configuration first
     if not LOGISTICALLY_BASE_URL:
         raise ValueError("LOGISTICALLY_BASE_URL is not set")
 
@@ -229,14 +249,16 @@ def find_load_in_logistically(load_number: str) -> dict:
     if not LOGISTICALLY_PASSWORD:
         raise ValueError("LOGISTICALLY_PASSWORD is not set")
 
+    login_url = f"{LOGISTICALLY_BASE_URL}/"
     order_url = f"{LOGISTICALLY_BASE_URL}/tms/#/3pl/orders/{load_number}"
 
     print(f"=== VERSION {APP_VERSION} ===")
-    print("=== Config ===")
+    print("=== Worker config check ===")
     print(json.dumps({
         "base_url": LOGISTICALLY_BASE_URL,
         "username_present": bool(LOGISTICALLY_USERNAME),
         "headless": HEADLESS,
+        "login_url": login_url,
         "order_url": order_url
     }))
 
@@ -250,20 +272,29 @@ def find_load_in_logistically(load_number: str) -> dict:
         page = context.new_page()
 
         try:
-            # Step 1: Login
+            # ------------------------------------------------
+            # Step 1: Perform login
+            # ------------------------------------------------
             perform_login(page)
 
-            # Step 2: Open order page
-            print("=== Opening order page ===")
+            # ------------------------------------------------
+            # Step 2: Open target order page directly
+            # ------------------------------------------------
+            print("=== Opening target order page ===")
             page.goto(order_url, wait_until="networkidle", timeout=60000)
             page.wait_for_timeout(3000)
 
-            print("=== Current URL ===", page.url)
+            print("=== Current URL after opening target order page ===")
+            print(page.url)
 
-            # Step 3: Detect result
+            # ------------------------------------------------
+            # Step 3: Classify the resulting page
+            # ------------------------------------------------
             page_result = detect_order_page(page, load_number)
 
-            # Step 4: Build structured response
+            # ------------------------------------------------
+            # Step 4: Build final structured result
+            # ------------------------------------------------
             result = {
                 "success": True,
                 "version": APP_VERSION,
@@ -276,11 +307,11 @@ def find_load_in_logistically(load_number: str) -> dict:
                 "message": (
                     f"Load {load_number} found in TMS"
                     if page_result["load_found"]
-                    else f"Load {load_number} not found in TMS or session invalid"
+                    else f"Load {load_number} not found in TMS or session was not on a valid order page"
                 )
             }
 
-            print("=== Result ===")
+            print("=== Worker result ===")
             print(json.dumps(result))
 
             return result
@@ -291,12 +322,15 @@ def find_load_in_logistically(load_number: str) -> dict:
 
 # ============================================================
 # Health endpoint
+# Useful for proving:
+# - latest code is deployed
+# - env vars are present
 # ============================================================
 
 @app.get("/")
 def health():
     """
-    Quick sanity check endpoint.
+    Basic health endpoint for deployment and config verification.
     """
     return {
         "status": "ok",
@@ -314,13 +348,21 @@ def health():
 @app.post("/lookup-load")
 def lookup_load(payload: LoadLookupRequest):
     """
-    Entry point for external systems (e.g. Freshdesk worker).
+    API endpoint called by upstream systems.
 
-    Validates input and triggers lookup workflow.
+    Expected input:
+    - ticket_id
+    - load_number_or_po
+    - invoice_number
+    - invoice_total
+
+    Returns:
+    - structured result indicating whether the load page
+      was truly found in TMS
     """
-
     try:
-        print(f"=== Incoming request === {payload.dict()}")
+        print("=== Incoming request ===")
+        print(payload.dict())
 
         if not payload.load_number_or_po:
             raise HTTPException(status_code=400, detail="Missing load_number_or_po")
@@ -328,7 +370,8 @@ def lookup_load(payload: LoadLookupRequest):
         return find_load_in_logistically(payload.load_number_or_po)
 
     except Exception as e:
-        print("=== ERROR ===", str(e))
+        print("=== WORKER ERROR ===")
+        print(str(e))
 
         raise HTTPException(
             status_code=500,
