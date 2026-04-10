@@ -10,7 +10,7 @@ app = FastAPI()
 # Version marker
 # ============================================================
 
-APP_VERSION = "worker-debug-2026-04-10-v4"
+APP_VERSION = "worker-debug-2026-04-10-v5"
 
 # ============================================================
 # Environment variables
@@ -20,9 +20,6 @@ LOGISTICALLY_BASE_URL = os.getenv("LOGISTICALLY_BASE_URL", "").rstrip("/")
 LOGISTICALLY_USERNAME = os.getenv("LOGISTICALLY_USERNAME", "")
 LOGISTICALLY_PASSWORD = os.getenv("LOGISTICALLY_PASSWORD", "")
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
-
-print("LOGISTICALLY_BASE_URL:", LOGISTICALLY_BASE_URL)
-print("LOGISTICALLY_USERNAME:", LOGISTICALLY_USERNAME)
 
 # ============================================================
 # Request model
@@ -36,12 +33,83 @@ class LoadLookupRequest(BaseModel):
 
 
 # ============================================================
+# Helpers
+# ============================================================
+
+def detect_order_page(page, load_number: str) -> dict:
+    """
+    Detect whether the current page is:
+    - a valid order page for the requested load
+    - a TMS error/access page
+    - something unknown
+    """
+    current_url = page.url
+    body_text = page.locator("body").inner_text(timeout=15000)
+
+    body_text_lower = body_text.lower()
+    current_url_lower = current_url.lower()
+    load_lower = load_number.lower()
+
+    # 1. Explicit TMS access / not-found style page
+    if (
+        "you don't have access to this page or resource" in body_text_lower
+        or "(403)" in body_text_lower
+    ):
+        return {
+            "page_type": "not_found_or_no_access",
+            "load_found": False,
+            "reason": "TMS returned access/not-found style page",
+            "current_url": current_url,
+            "body_preview": body_text[:1000]
+        }
+
+    # 2. Strong positive signal: actual order page
+    strong_found_signals = [
+        f"edit order: order {load_lower}" in body_text_lower,
+        f"order {load_lower}" in body_text_lower,
+        f"/orders/{load_lower}" in current_url_lower
+    ]
+
+    if any(strong_found_signals):
+        return {
+            "page_type": "order_page",
+            "load_found": True,
+            "reason": "Detected real order page",
+            "current_url": current_url,
+            "body_preview": body_text[:1000]
+        }
+
+    # 3. Weak fallback if load number is somewhere on page
+    if load_lower in body_text_lower:
+        return {
+            "page_type": "possible_order_page",
+            "load_found": True,
+            "reason": "Load number appears in page body",
+            "current_url": current_url,
+            "body_preview": body_text[:1000]
+        }
+
+    # 4. Unknown page state
+    return {
+        "page_type": "unknown",
+        "load_found": False,
+        "reason": "Could not confirm order page",
+        "current_url": current_url,
+        "body_preview": body_text[:1000]
+    }
+
+
+# ============================================================
 # Core worker logic
 # ============================================================
 
 def find_load_in_logistically(load_number: str) -> dict:
     """
     Logs into Logistically and attempts to open a specific load page.
+    Correctly handles:
+    - load found
+    - 403 / no access / not found page
+    - unknown page state
     """
 
     if not LOGISTICALLY_BASE_URL:
@@ -53,10 +121,7 @@ def find_load_in_logistically(load_number: str) -> dict:
     if not LOGISTICALLY_PASSWORD:
         raise ValueError("LOGISTICALLY_PASSWORD is not set")
 
-    # Based on the login page HTML you provided, the login form is on "/"
     login_url = f"{LOGISTICALLY_BASE_URL}/"
-
-    # Based on your SOP and earlier examples, this is the order route pattern
     order_url = f"{LOGISTICALLY_BASE_URL}/tms/#/3pl/orders/{load_number}"
 
     print(f"=== VERSION {APP_VERSION} ===")
@@ -78,7 +143,9 @@ def find_load_in_logistically(load_number: str) -> dict:
         page = context.new_page()
 
         try:
+            # ------------------------------------------------
             # Step 1: Open login page
+            # ------------------------------------------------
             print("=== Opening Logistically login page ===")
             page.goto(login_url, wait_until="networkidle", timeout=60000)
             page.wait_for_timeout(2000)
@@ -86,10 +153,9 @@ def find_load_in_logistically(load_number: str) -> dict:
             print("=== Current URL after login page load ===")
             print(page.url)
 
-            print("=== Login page content preview ===")
-            print(page.content()[:1200])
-
-            # Step 2: Fill login form using exact selectors
+            # ------------------------------------------------
+            # Step 2: Fill login form
+            # ------------------------------------------------
             print("=== Filling email field ===")
             page.locator("#email").fill(LOGISTICALLY_USERNAME)
 
@@ -99,7 +165,9 @@ def find_load_in_logistically(load_number: str) -> dict:
             print("=== Clicking sign-in button ===")
             page.locator("#sign-in").click()
 
+            # ------------------------------------------------
             # Step 3: Wait after login
+            # ------------------------------------------------
             print("=== Waiting after login click ===")
             page.wait_for_timeout(5000)
             page.wait_for_load_state("networkidle", timeout=60000)
@@ -107,10 +175,9 @@ def find_load_in_logistically(load_number: str) -> dict:
             print("=== Current URL after login attempt ===")
             print(page.url)
 
-            print("=== Post-login page content preview ===")
-            print(page.content()[:1200])
-
+            # ------------------------------------------------
             # Step 4: Open target order page directly
+            # ------------------------------------------------
             print("=== Opening Logistically load page ===")
             page.goto(order_url, wait_until="networkidle", timeout=60000)
             page.wait_for_timeout(3000)
@@ -119,20 +186,25 @@ def find_load_in_logistically(load_number: str) -> dict:
             print("=== Current URL after opening order page ===")
             print(current_url)
 
-            body_text = page.locator("body").inner_text(timeout=15000)
-
-            print("=== Body text preview ===")
-            print(body_text[:1500])
-
-            load_found = (load_number in current_url) or (load_number in body_text)
+            # ------------------------------------------------
+            # Step 5: Detect page outcome
+            # ------------------------------------------------
+            page_result = detect_order_page(page, load_number)
 
             result = {
                 "success": True,
                 "version": APP_VERSION,
-                "load_found": load_found,
+                "load_found": page_result["load_found"],
+                "page_type": page_result["page_type"],
+                "reason": page_result["reason"],
                 "load_number_or_po": load_number,
-                "current_url": current_url,
-                "message": f"Load {load_number} found" if load_found else f"Load {load_number} not found"
+                "current_url": page_result["current_url"],
+                "body_preview": page_result["body_preview"],
+                "message": (
+                    f"Load {load_number} found"
+                    if page_result["load_found"]
+                    else f"Load {load_number} not found or inaccessible"
+                )
             }
 
             print("=== Worker result ===")
