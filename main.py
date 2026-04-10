@@ -15,6 +15,12 @@ LOGISTICALLY_USERNAME = os.getenv("LOGISTICALLY_USERNAME", "")
 LOGISTICALLY_PASSWORD = os.getenv("LOGISTICALLY_PASSWORD", "")
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "false"
 
+print("=== ENV DEBUG AT STARTUP ===")
+print(f"BASE_URL=[{LOGISTICALLY_BASE_URL}]")
+print(f"USERNAME=[{LOGISTICALLY_USERNAME}]")
+print(f"PASSWORD_SET={[bool(LOGISTICALLY_PASSWORD)]}")
+print(f"HEADLESS=[{HEADLESS}]")
+
 
 # ============================================================
 # Request model
