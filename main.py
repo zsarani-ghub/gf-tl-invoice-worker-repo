@@ -10,7 +10,7 @@ app = FastAPI()
 # Version marker
 # ============================================================
 
-APP_VERSION = "worker-debug-2026-04-10-v2"
+APP_VERSION = "worker-debug-2026-04-10-v3"
 
 # ============================================================
 # Environment variables
