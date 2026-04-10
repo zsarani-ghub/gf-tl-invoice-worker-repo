@@ -40,7 +40,8 @@ def detect_order_page(page, load_number: str) -> dict:
     """
     Detect whether the current page is:
     - a valid order page for the requested load
-    - a TMS error/access page
+    - a login page
+    - a TMS 403/no-access page
     - something unknown
     """
     current_url = page.url
@@ -50,7 +51,32 @@ def detect_order_page(page, load_number: str) -> dict:
     current_url_lower = current_url.lower()
     load_lower = load_number.lower()
 
-    # 1. Explicit TMS access / not-found style page
+    # ------------------------------------------------
+    # 1. Explicit login page detection
+    # ------------------------------------------------
+    login_signals = [
+        "sign in",
+        "e-mail",
+        "password",
+        "forgot password",
+        "stay signed in",
+        "powered by logistically tms"
+    ]
+
+    login_signal_count = sum(1 for s in login_signals if s in body_text_lower)
+
+    if login_signal_count >= 3:
+        return {
+            "page_type": "login_page",
+            "load_found": False,
+            "reason": "Session appears to be on login page, not order page",
+            "current_url": current_url,
+            "body_preview": body_text[:1000]
+        }
+
+    # ------------------------------------------------
+    # 2. Explicit TMS access / not-found style page
+    # ------------------------------------------------
     if (
         "you don't have access to this page or resource" in body_text_lower
         or "(403)" in body_text_lower
@@ -63,33 +89,41 @@ def detect_order_page(page, load_number: str) -> dict:
             "body_preview": body_text[:1000]
         }
 
-    # 2. Strong positive signal: actual order page
-    strong_found_signals = [
-        f"edit order: order {load_lower}" in body_text_lower,
-        f"order {load_lower}" in body_text_lower,
-        f"/orders/{load_lower}" in current_url_lower
+    # ------------------------------------------------
+    # 3. Strong positive order page signals
+    # IMPORTANT:
+    # URL alone is NOT enough because direct navigation
+    # always includes the requested load number.
+    # ------------------------------------------------
+    strong_order_signals = [
+        f"edit order: order {load_lower}",
+        f"order #",
+        "customer:",
+        "ship date:",
+        "order status:",
+        "carrier:",
+        "bids",
+        "ref numbers",
+        "attachments",
+        "cost",
+        "invoice"
     ]
 
-    if any(strong_found_signals):
+    strong_signal_count = sum(1 for s in strong_order_signals if s in body_text_lower)
+
+    # Require the load number AND enough real order-page signals
+    if load_lower in body_text_lower and strong_signal_count >= 4:
         return {
             "page_type": "order_page",
             "load_found": True,
-            "reason": "Detected real order page",
+            "reason": "Detected real order page using order-page content signals",
             "current_url": current_url,
             "body_preview": body_text[:1000]
         }
 
-    # 3. Weak fallback if load number is somewhere on page
-    if load_lower in body_text_lower:
-        return {
-            "page_type": "possible_order_page",
-            "load_found": True,
-            "reason": "Load number appears in page body",
-            "current_url": current_url,
-            "body_preview": body_text[:1000]
-        }
-
-    # 4. Unknown page state
+    # ------------------------------------------------
+    # 4. Unknown / not confirmed
+    # ------------------------------------------------
     return {
         "page_type": "unknown",
         "load_found": False,
@@ -97,7 +131,6 @@ def detect_order_page(page, load_number: str) -> dict:
         "current_url": current_url,
         "body_preview": body_text[:1000]
     }
-
 
 # ============================================================
 # Core worker logic
@@ -201,9 +234,9 @@ def find_load_in_logistically(load_number: str) -> dict:
                 "current_url": page_result["current_url"],
                 "body_preview": page_result["body_preview"],
                 "message": (
-                    f"Load {load_number} found"
+                    f"Load {load_number} found in TMS"
                     if page_result["load_found"]
-                    else f"Load {load_number} not found or inaccessible"
+                    else f"Load {load_number} not found in TMS or session was not on a valid order page"
                 )
             }
 
