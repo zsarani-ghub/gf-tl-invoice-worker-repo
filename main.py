@@ -21,6 +21,9 @@ LOGISTICALLY_USERNAME = os.getenv("LOGISTICALLY_USERNAME", "")
 LOGISTICALLY_PASSWORD = os.getenv("LOGISTICALLY_PASSWORD", "")
 HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 
+print("LOGISTICALLY_BASE_URL:", LOGISTICALLY_BASE_URL)
+print("LOGISTICALLY_USERNAME:", LOGISTICALLY_USERNAME)
+
 # ============================================================
 # Request model
 # ============================================================
