@@ -1,6 +1,9 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PlaywrightTimeoutError,
+)
 import os
 import json
 
@@ -15,7 +18,7 @@ app = FastAPI()
 # Change this whenever you want to prove a fresh deploy happened
 # ============================================================
 
-APP_VERSION = "worker-debug-2026-04-10-v8"
+APP_VERSION = "worker-debug-2026-04-10-v9"
 
 # ============================================================
 # Environment variables injected through Cloud Run
@@ -30,6 +33,7 @@ HEADLESS = os.getenv("HEADLESS", "true").lower() == "true"
 # Incoming request schema
 # ============================================================
 
+
 class LoadLookupRequest(BaseModel):
     ticket_id: int
     load_number_or_po: str
@@ -38,12 +42,15 @@ class LoadLookupRequest(BaseModel):
 
 
 # ============================================================
-# Helper: Identify whether current page is the login page
+# Helper: Identify whether current page still looks like login
 # ============================================================
+
 
 def is_login_page_text(body_text: str) -> bool:
     """
     Detect whether the current page still looks like the TMS login page.
+
+    We use multiple text signals rather than trusting one keyword.
     """
     body_text_lower = body_text.lower()
 
@@ -53,28 +60,29 @@ def is_login_page_text(body_text: str) -> bool:
         "password",
         "forgot password",
         "stay signed in",
-        "powered by logistically tms"
+        "powered by logistically tms",
     ]
 
-    signal_count = sum(1 for s in login_signals if s in body_text_lower)
+    signal_count = sum(1 for signal in login_signals if signal in body_text_lower)
     return signal_count >= 3
 
 
 # ============================================================
-# Helper: Detect final page classification after opening order URL
+# Helper: Classify final page after attempting to open order URL
 # ============================================================
+
 
 def detect_order_page(page, load_number: str) -> dict:
     """
-    Classify the current page into one of:
+    Classify the resulting page into one of:
     - login_page
     - not_found_or_no_access
     - order_page
     - unknown
 
     IMPORTANT:
-    URL alone is not enough because the attempted order URL
-    itself always contains the requested load number.
+    URL alone is not trusted because the requested order URL itself
+    always includes the load number even when the page is invalid.
     """
     current_url = page.url
     body_text = page.locator("body").inner_text(timeout=15000)
@@ -82,17 +90,21 @@ def detect_order_page(page, load_number: str) -> dict:
     body_text_lower = body_text.lower()
     load_lower = load_number.lower()
 
-    # 1. Login page
+    # --------------------------------------------------------
+    # 1. Detect login page
+    # --------------------------------------------------------
     if is_login_page_text(body_text):
         return {
             "page_type": "login_page",
             "load_found": False,
             "reason": "Session appears to be on login page, not order page",
             "current_url": current_url,
-            "body_preview": body_text[:1000]
+            "body_preview": body_text[:1000],
         }
 
-    # 2. Explicit 403 / no-access page
+    # --------------------------------------------------------
+    # 2. Detect explicit TMS 403 / no-access page
+    # --------------------------------------------------------
     if (
         "you don't have access to this page or resource" in body_text_lower
         or "(403)" in body_text_lower
@@ -102,10 +114,12 @@ def detect_order_page(page, load_number: str) -> dict:
             "load_found": False,
             "reason": "TMS returned access/not-found style page",
             "current_url": current_url,
-            "body_preview": body_text[:1000]
+            "body_preview": body_text[:1000],
         }
 
-    # 3. Strong real order page signals
+    # --------------------------------------------------------
+    # 3. Detect real order page using strong content signals
+    # --------------------------------------------------------
     strong_order_signals = [
         f"edit order: order {load_lower}",
         "order #",
@@ -117,99 +131,132 @@ def detect_order_page(page, load_number: str) -> dict:
         "ref numbers",
         "attachments",
         "cost",
-        "invoice"
+        "invoice",
     ]
 
-    strong_signal_count = sum(1 for s in strong_order_signals if s in body_text_lower)
+    strong_signal_count = sum(
+        1 for signal in strong_order_signals if signal in body_text_lower
+    )
 
+    # A real order page should contain the load number in body text
+    # plus enough strong order-page indicators.
     if load_lower in body_text_lower and strong_signal_count >= 4:
         return {
             "page_type": "order_page",
             "load_found": True,
             "reason": "Detected real order page using order-page content signals",
             "current_url": current_url,
-            "body_preview": body_text[:1000]
+            "body_preview": body_text[:1000],
         }
 
-    # 4. Unknown fallback
+    # --------------------------------------------------------
+    # 4. Fallback unknown state
+    # --------------------------------------------------------
     return {
         "page_type": "unknown",
         "load_found": False,
         "reason": "Could not confirm order page",
         "current_url": current_url,
-        "body_preview": body_text[:1000]
+        "body_preview": body_text[:1000],
     }
 
 
 # ============================================================
-# Helper: Perform login and confirm we reached TMS home
+# Helper: Perform login using the real HTML form
 # ============================================================
+
 
 def perform_login(page):
     """
-    Perform login and confirm that the app reaches the post-login
-    TMS shell / home page.
+    Perform login in a controlled way using the actual HTML login form.
 
-    Expected successful landing page pattern:
-    .../tms/#/3pl/
+    This version:
+    - opens login page
+    - fills email + password
+    - sets hidden return_uri explicitly
+    - submits the real form once
+    - captures cookies before/after
+    - confirms whether we reached the post-login TMS shell/home
     """
     login_url = f"{LOGISTICALLY_BASE_URL}/"
-    expected_post_login_fragment = "/tms/#/3pl"
+    expected_post_login_fragment = "/tms/#/3pl/"
 
     print("=== Opening login page ===")
     page.goto(login_url, wait_until="networkidle", timeout=60000)
     page.wait_for_timeout(2000)
 
+    # Fill credentials into the actual login inputs
     print("=== Filling email field ===")
     page.locator("#email").fill(LOGISTICALLY_USERNAME)
 
     print("=== Filling password field ===")
     page.locator("#password").fill(LOGISTICALLY_PASSWORD)
 
-    print("=== Clicking sign-in button ===")
-    page.locator("#sign-in").click()
+    # Explicitly set return_uri because the page script normally populates it
+    # from window.location.href. We want to force a clean landing path.
+    print("=== Setting return_uri explicitly ===")
+    page.locator("#return_uri").evaluate(
+        "(el, value) => el.value = value",
+        f"{LOGISTICALLY_BASE_URL}/tms/#/3pl/",
+    )
 
-    # Give the app time to authenticate and redirect
-    page.wait_for_timeout(5000)
+    # Capture cookies before submit for comparison
+    context = page.context
+    cookies_before = context.cookies()
+    print("=== Cookies before login ===")
+    print(cookies_before)
 
-    # Try to wait until URL indicates post-login shell/home
+    # Submit the actual form once, in a controlled way
+    print("=== Submitting login form ===")
     try:
-        page.wait_for_url(f"**{expected_post_login_fragment}**", timeout=30000)
+        with page.expect_navigation(wait_until="networkidle", timeout=30000):
+            page.locator("#login-form").evaluate("form => form.submit()")
     except PlaywrightTimeoutError:
-        print("=== Timed out waiting for post-login TMS URL ===")
+        print("=== No full navigation detected during login submit ===")
 
-    # Let the page settle after redirect
+    # Give the site time to establish session / redirect
+    page.wait_for_timeout(4000)
+
     try:
-        page.wait_for_load_state("networkidle", timeout=20000)
+        page.wait_for_load_state("networkidle", timeout=15000)
     except Exception:
         print("=== Network did not fully settle after login ===")
 
     current_url = page.url
     body_text = page.locator("body").inner_text(timeout=15000)
 
-    print("=== URL after login attempt ===")
+    print("=== URL after login submit ===")
     print(current_url)
 
-    print("=== Body preview after login attempt ===")
+    print("=== Body preview after login submit ===")
     print(body_text[:1200])
 
-    # Save screenshot for debugging
+    # Capture cookies after submit to see whether session changed
+    cookies_after = context.cookies()
+    print("=== Cookies after login ===")
+    print(cookies_after)
+
+    # Save a screenshot to assist future debugging
     screenshot_path = "/tmp/post_login_state.png"
     page.screenshot(path=screenshot_path, full_page=True)
     print(f"=== Saved screenshot to {screenshot_path} ===")
 
-    # Real success test: we should be in the TMS shell/home
+    # Determine whether we actually reached the post-login TMS shell/home
     if expected_post_login_fragment not in current_url:
         raise ValueError(
-            f"Login failed — did not reach TMS home. URL={current_url} | "
-            f"Body preview={body_text[:500]}"
+            "Login failed — did not reach TMS home. "
+            f"URL={current_url} | "
+            f"Body preview={body_text[:500]} | "
+            f"Cookies after login={cookies_after}"
         )
 
-    # If somehow still on login page, also fail
+    # Extra protection: even if URL changed, page must not still be login page
     if is_login_page_text(body_text):
         raise ValueError(
-            f"Login failed — still on login page. URL={current_url} | "
-            f"Body preview={body_text[:500]}"
+            "Login failed — still on login page. "
+            f"URL={current_url} | "
+            f"Body preview={body_text[:500]} | "
+            f"Cookies after login={cookies_after}"
         )
 
     print("=== Login successful - reached TMS home ===")
@@ -217,18 +264,20 @@ def perform_login(page):
 
 
 # ============================================================
-# Core business logic:
-# Login -> open target order page -> classify result
+# Core business logic
 # ============================================================
+
 
 def find_load_in_logistically(load_number: str) -> dict:
     """
     Full workflow:
-    1. Validate config
-    2. Login and confirm TMS home page reached
-    3. Navigate directly to target order URL
-    4. Classify final page
+    1. Validate configuration
+    2. Login and confirm TMS shell/home reached
+    3. Open target order URL directly
+    4. Detect whether final page is valid order / login / 403 / unknown
+    5. Return structured result
     """
+    # Validate required configuration first
     if not LOGISTICALLY_BASE_URL:
         raise ValueError("LOGISTICALLY_BASE_URL is not set")
 
@@ -243,28 +292,45 @@ def find_load_in_logistically(load_number: str) -> dict:
 
     print(f"=== VERSION {APP_VERSION} ===")
     print("=== Worker config check ===")
-    print(json.dumps({
-        "base_url": LOGISTICALLY_BASE_URL,
-        "username_present": bool(LOGISTICALLY_USERNAME),
-        "headless": HEADLESS,
-        "login_url": login_url,
-        "order_url": order_url
-    }))
+    print(
+        json.dumps(
+            {
+                "base_url": LOGISTICALLY_BASE_URL,
+                "username_present": bool(LOGISTICALLY_USERNAME),
+                "headless": HEADLESS,
+                "login_url": login_url,
+                "order_url": order_url,
+            }
+        )
+    )
 
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=HEADLESS,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            args=["--no-sandbox", "--disable-dev-shm-usage"],
         )
 
-        context = browser.new_context()
+        # Use a realistic browser fingerprint similar to a normal desktop browser
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/146.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1600, "height": 900},
+        )
+
         page = context.new_page()
 
         try:
-            # Step 1: Login and confirm we reached TMS home
+            # ------------------------------------------------
+            # Step 1: Login and confirm TMS home reached
+            # ------------------------------------------------
             perform_login(page)
 
-            # Step 2: Open the target order URL directly
+            # ------------------------------------------------
+            # Step 2: Open target order URL directly
+            # ------------------------------------------------
             print("=== Opening target order page ===")
             page.goto(order_url, wait_until="networkidle", timeout=60000)
             page.wait_for_timeout(3000)
@@ -272,9 +338,14 @@ def find_load_in_logistically(load_number: str) -> dict:
             print("=== Current URL after opening target order page ===")
             print(page.url)
 
-            # Step 3: Detect whether the resulting page is real order / error / login
+            # ------------------------------------------------
+            # Step 3: Classify resulting page
+            # ------------------------------------------------
             page_result = detect_order_page(page, load_number)
 
+            # ------------------------------------------------
+            # Step 4: Build final structured response
+            # ------------------------------------------------
             result = {
                 "success": True,
                 "version": APP_VERSION,
@@ -288,7 +359,7 @@ def find_load_in_logistically(load_number: str) -> dict:
                     f"Load {load_number} found in TMS"
                     if page_result["load_found"]
                     else f"Load {load_number} not found in TMS or session was not on a valid order page"
-                )
+                ),
             }
 
             print("=== Worker result ===")
@@ -304,19 +375,20 @@ def find_load_in_logistically(load_number: str) -> dict:
 # Health endpoint
 # ============================================================
 
+
 @app.get("/")
 def health():
     """
-    Health endpoint used to confirm:
+    Health endpoint to confirm:
     - latest code is deployed
-    - env vars are present
+    - environment variables are present
     """
     return {
         "status": "ok",
         "version": APP_VERSION,
         "username_present": bool(LOGISTICALLY_USERNAME),
         "base_url_present": bool(LOGISTICALLY_BASE_URL),
-        "headless": HEADLESS
+        "headless": HEADLESS,
     }
 
 
@@ -324,10 +396,20 @@ def health():
 # Main API endpoint
 # ============================================================
 
+
 @app.post("/lookup-load")
 def lookup_load(payload: LoadLookupRequest):
     """
     Main worker endpoint for TMS load lookup.
+
+    Expected input:
+    - ticket_id
+    - load_number_or_po
+    - invoice_number
+    - invoice_total
+
+    Returns structured result indicating whether the target
+    load page was truly found in TMS.
     """
     try:
         print("=== Incoming request ===")
@@ -349,6 +431,6 @@ def lookup_load(payload: LoadLookupRequest):
                 "error": str(e),
                 "username_present": bool(LOGISTICALLY_USERNAME),
                 "base_url_present": bool(LOGISTICALLY_BASE_URL),
-                "headless": HEADLESS
-            }
+                "headless": HEADLESS,
+            },
         )
